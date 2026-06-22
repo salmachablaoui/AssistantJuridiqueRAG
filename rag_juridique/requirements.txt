@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pymupdf
+faiss-cpu
+numpy
+requests
+sentence-transformers
+rank-bm25
+python-multipart
+torch
+transformers
