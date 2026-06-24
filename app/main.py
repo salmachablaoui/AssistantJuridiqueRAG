@@ -1,49 +1,114 @@
-# app/main.py
+# ============================================================
+# main.py — Point d'entrée FastAPI
+# Lance : uvicorn main:app --host 0.0.0.0 --port 8000
+# ============================================================
+
+import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import logging
+from contextlib import asynccontextmanager
+from app.config import settings
 
-from app.database import engine, Base
-from app.routes import upload_routes, chat_routes
+logger = structlog.get_logger()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# Create database tables
-try:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created successfully")
-except Exception as e:
-    logger.error(f"Failed to create tables: {e}")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Initialisation au démarrage, nettoyage à l'arrêt.
+    Remplace les anciens @app.on_event("startup").
+    """
+    logger.info("app_starting", debug=settings.DEBUG)
 
-app = FastAPI(title="RAG Local Assistant", version="1.0", docs_url="/docs")
+    # ── 1. Connexion PostgreSQL ───────────────────────────────
+    from app.db.postgres import check_connection
+    pg_ok = await check_connection()
+    if pg_ok:
+        logger.info("postgresql_connected", db=settings.POSTGRES_DB)
+    else:
+        logger.error("postgresql_connection_failed")
 
-# Enable CORS
+    # ── 2. Initialiser Qdrant ─────────────────────────────────
+    from app.services.qdrant_service import ensure_collection_exists
+    try:
+        ensure_collection_exists()
+        logger.info("qdrant_ready", collection=settings.QDRANT_COLLECTION)
+    except Exception as e:
+        logger.error("qdrant_init_failed", error=str(e))
+
+    # ── 3. Préchargement du modèle d'embedding ────────────────
+    # Charge le modèle en mémoire une seule fois au démarrage
+    # Évite la latence sur la première requête utilisateur
+    try:
+        from app.services.embedding_service import _load_model
+        _load_model()
+        logger.info("embedding_model_preloaded", model=settings.EMBEDDING_MODEL)
+    except Exception as e:
+        logger.warning("embedding_model_preload_failed", error=str(e))
+
+    logger.info("app_ready")
+    yield
+
+    # ── Shutdown ──────────────────────────────────────────────
+    logger.info("app_shutting_down")
+    from app.db.postgres import engine
+    await engine.dispose()
+    logger.info("database_connections_closed")
+
+
+# ── Application FastAPI ───────────────────────────────────────
+
+app = FastAPI(
+    title="ANP Legal RAG API",
+    description=(
+        "Hybrid Legal RAG System — Combines PostgreSQL structured queries "
+        "with semantic vector search for intelligent legal document assistance."
+    ),
+    version="2.0.0",
+    lifespan=lifespan,
+    docs_url="/docs" if settings.DEBUG else None,   # Désactiver en prod
+    redoc_url="/redoc" if settings.DEBUG else None,
+)
+
+# ── CORS — Autoriser Laravel ──────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost",
+        "http://localhost:8080",
+        "http://127.0.0.1",
+        "http://127.0.0.1:8080",
+        # Ajouter le domaine Laravel en production
+        # "https://your-laravel-app.com",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-# Include routers
-app.include_router(upload_routes.router, prefix="/api", tags=["Upload"])
-app.include_router(chat_routes.router, prefix="/api", tags=["Chat"])
+# ── Routes ────────────────────────────────────────────────────
+from app.api.routes import router
+app.include_router(router, prefix="")
 
+
+# ── Route racine ──────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
-        "message": "RAG Local Assistant API",
+        "name": "ANP Legal RAG API",
+        "version": "2.0.0",
         "status": "running",
-        "endpoints": {
-            "upload": "POST /api/upload",
-            "chat": "POST /api/chat",
-            "docs": "/docs"
-        }
+        "docs": "/docs",
+        "health": "/health",
     }
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8001,
+        reload=settings.DEBUG,
+        log_level="info",
+    )
