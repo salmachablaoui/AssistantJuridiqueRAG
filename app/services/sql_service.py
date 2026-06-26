@@ -283,3 +283,80 @@ def format_sql_results_as_context(
         lines.append(f"{i}. " + " | ".join(parts))
 
     return "\n".join(lines)
+
+
+
+
+async def generate_dynamic_sql(question: str, schema_context: str = None) -> Optional[str]:
+    """
+    Génère une requête SQL via LLM pour les questions non couvertes.
+    Retourne None si la génération échoue ou est dangereuse.
+    """
+    from app.services.llm_service import call_ollama
+    
+    schema = schema_context or """
+Tables disponibles (schéma PostgreSQL) :
+- dossiers(id, numero_dossier, affaire, objet_litige, statut, date_creation, avocat_id, partie_adverse_id)
+- avocats(id, nom, prenom, email, telephone, specialite, ville, statut)
+- clients(id, nom_client, email, telephone)
+- seances(id, dossier_id, stade_id, date_seance, lieu, statut, decision, jugement)
+- honoraires(id, dossier_id, avocat_id, montant_total, montant_paye, reste_a_payer, statut, date_limite)
+- documents(id, dossier_id, nom_fichier, type_document, statut, statut_validation, date_scan, created_at)
+- stades(id, type)
+
+Statuts dossiers : 'en_cours', 'cloture', 'suspendu'
+Statuts honoraires : 'impaye', 'partiel', 'paye'
+Statuts séances : 'programmee', 'tenue', 'reportee'
+"""
+    
+    prompt = f"""Tu es un expert SQL PostgreSQL. Génère UNE requête SQL SELECT pour répondre à cette question.
+
+SCHÉMA :
+{schema}
+
+RÈGLES STRICTES :
+- Utilise UNIQUEMENT SELECT (jamais INSERT, UPDATE, DELETE, DROP)
+- Joins avec LEFT JOIN quand possible
+- LIMIT 20 par défaut
+- Utilise des alias clairs
+- Retourne UNIQUEMENT le SQL, sans explication ni markdown
+
+QUESTION : {question}
+
+SQL :"""
+    
+    try:
+        raw = await call_ollama(prompt, temperature=0.1)
+        # Sécurité : rejeter si contient des mots dangereux
+        dangerous = ["insert", "update", "delete", "drop", "truncate", "alter", "create"]
+        sql_lower = raw.lower()
+        if any(word in sql_lower for word in dangerous):
+            logger.warning("dynamic_sql_rejected", reason="dangerous_keyword", sql=raw[:100])
+            return None
+        
+        # Nettoyer le SQL (retirer les backticks markdown si présents)
+        sql = raw.strip().strip("`").replace("```sql", "").replace("```", "").strip()
+        
+        if not sql.lower().startswith("select"):
+            return None
+            
+        logger.info("dynamic_sql_generated", sql=sql[:200])
+        return sql
+    except Exception as e:
+        logger.error("dynamic_sql_error", error=str(e))
+        return None
+
+
+async def execute_dynamic_sql(sql: str) -> list[dict]:
+    """Exécute un SQL dynamique généré par LLM (lecture seule)."""
+    # Double vérification sécurité
+    if not sql.strip().lower().startswith("select"):
+        raise ValueError("Seules les requêtes SELECT sont autorisées")
+    
+    try:
+        results = await execute_query(sql, {})
+        logger.info("dynamic_sql_executed", n_results=len(results))
+        return results
+    except Exception as e:
+        logger.error("dynamic_sql_execution_error", error=str(e))
+        raise

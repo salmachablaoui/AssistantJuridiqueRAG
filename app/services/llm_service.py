@@ -1,54 +1,34 @@
-# ============================================================
-# app/services/llm_service.py
-# REFACTORÉ depuis chat_service.py
-#
-# Améliorations :
-#   - Prompts différenciés par mode (SQL / VECTOR / HYBRID)
-#   - Réponse structurée avec sources et score de confiance
-#   - Retry automatique sur timeout
-#   - Support async natif
-# ============================================================
-
+# app/services/llm_service.py — v3
 import httpx
 import structlog
+from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential
 from app.config import settings
 
 logger = structlog.get_logger()
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-)
-async def call_ollama(
-    prompt: str,
-    system_prompt: str = None,
-    temperature: float = None,
-) -> str:
-    temperature = temperature or settings.LLM_TEMPERATURE
-
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+async def call_ollama(prompt: str, system_prompt: str = None, temperature: float = None) -> str:
+    temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
     payload = {
-    "model": settings.CHAT_MODEL,
-    "prompt": prompt,
-    "stream": False,
-    "options": {
-        "temperature": 0.1,
-        "num_predict": 100,   # ← très court
-        "num_ctx": 512,       # ← contexte réduit
-    },
-}
-
+        "model": settings.CHAT_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "num_predict": 400,
+            "num_ctx": 2048,
+            "num_thread": 4,
+            "repeat_penalty": 1.1,
+        },
+    }
     if system_prompt:
         payload["system"] = system_prompt
 
     try:
-        async with httpx.AsyncClient(timeout=300) as client:  # ← 300 secondes
-            response = await client.post(
-                f"{settings.OLLAMA_URL}/api/generate",
-                json=payload,
-            )
+        async with httpx.AsyncClient(timeout=300) as client:
+            response = await client.post(f"{settings.OLLAMA_URL}/api/generate", json=payload)
             response.raise_for_status()
             return response.json()["response"].strip()
     except Exception as e:
@@ -56,8 +36,7 @@ async def call_ollama(
         return f"[LLM indisponible] {str(e)}"
 
 
-async def call_ollama_raw(prompt: str, max_tokens: int = 100) -> str:
-    """Appel minimal pour le router (classification courte)"""
+async def call_ollama_raw(prompt: str, max_tokens: int = 10) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             f"{settings.OLLAMA_URL}/api/generate",
@@ -65,54 +44,96 @@ async def call_ollama_raw(prompt: str, max_tokens: int = 100) -> str:
                 "model": settings.ROUTER_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                "options": {
-    "temperature": temperature,
-    "top_p": 0.9,
-    "num_predict": 256,    # ← Réduit à 256 pour réponses plus rapides
-},
+                "options": {"temperature": 0.0, "num_predict": max_tokens},
             },
         )
         response.raise_for_status()
         return response.json()["response"].strip()
 
 
-# ── Prompts par mode de recherche ─────────────────────────────
+# ── Prompts système ───────────────────────────────────────────
 
-SYSTEM_PROMPT_SQL = """Tu es un assistant juridique expert du système de gestion de dossiers ANP Legal.
-Tu réponds aux questions basées sur des données structurées de la base de données.
-Réponds en français de manière claire, concise et professionnelle.
-Si des montants sont présents, précise toujours la devise (MAD).
-Ne fabrique JAMAIS d'informations. Utilise UNIQUEMENT les données fournies."""
+SYSTEM_PROMPT_SQL = """Tu es un assistant juridique ANP Legal. 
+Réponds en français, de manière courte et claire.
+Utilise UNIQUEMENT les données fournies. Ne fabrique rien.
+Si les données sont vides, dis "Aucun résultat trouvé."."""
 
-SYSTEM_PROMPT_VECTOR = """Tu es un assistant juridique expert en droit marocain.
-Tu réponds aux questions basées sur le contenu des documents juridiques fournis.
-Cite toujours la source (nom du document) quand tu extrais une information.
-Réponds en français de manière précise et professionnelle.
-Si tu ne trouves pas l'information dans les documents fournis, dis-le clairement."""
+SYSTEM_PROMPT_VECTOR = """Tu es un assistant juridique ANP Legal spécialisé dans l'analyse de documents.
+RÈGLES ABSOLUES :
+1. Utilise UNIQUEMENT les extraits fournis. Ne déduis rien d'autre.
+2. Si l'information demandée n'est pas dans les extraits : réponds "Cette information ne figure pas dans les documents disponibles."
+3. Cite le nom du fichier source entre parenthèses après chaque information.
+4. Réponds en français, de manière concise et structurée.
+5. Ne mentionne jamais de dossiers ou documents absents des extraits."""
 
-SYSTEM_PROMPT_HYBRID = """Tu es un assistant juridique expert du système ANP Legal.
-Tu as accès à la fois aux données structurées (dossiers, dates, montants) et au contenu des documents.
-Combine les deux sources pour donner une réponse complète et précise.
-Distingue clairement ce qui vient de la base de données vs des documents.
-Réponds en français de manière professionnelle."""
+SYSTEM_PROMPT_HYBRID = """Tu es un assistant juridique ANP Legal.
+Tu combines données structurées (base de données) et contenu de documents.
+RÈGLES :
+1. Utilise UNIQUEMENT les informations explicitement fournies.
+2. Si un dossier n'est pas trouvé : dis-le clairement en une phrase.
+3. Distingue données base vs documents : marque [Base] ou [Document].
+4. Réponds en français, de manière structurée et concise."""
 
 
-async def generate_sql_answer(
-    question: str,
-    sql_context: str,
-    query_key: str,
-) -> dict:
+# ── Format direct sans LLM ────────────────────────────────────
+
+def format_sql_results_direct(results: list[dict], query_key: str) -> Optional[str]:
+    DIRECT_KEYS = {"dashboard_stats", "count_dossiers", "total_honoraires"}
+    if query_key not in DIRECT_KEYS or not results:
+        return None
+
+    if query_key == "dashboard_stats":
+        r = results[0]
+        def fmt(v):
+            try: return f"{float(v):,.2f} MAD"
+            except: return f"{v} MAD"
+        return (
+            f"📊 Tableau de bord ANP Legal\n\n"
+            f"📁 Dossiers\n"
+            f"• En cours    : {r.get('dossiers_en_cours', 0)}\n"
+            f"• Clôturés    : {r.get('dossiers_clotures', 0)}\n"
+            f"• Suspendus   : {r.get('dossiers_suspendus', 0)}\n\n"
+            f"📅 Séances à venir : {r.get('seances_a_venir', 0)}\n\n"
+            f"💰 Honoraires\n"
+            f"• Impayés     : {r.get('honoraires_impayes', 0)}\n"
+            f"• À recouvrer : {fmt(r.get('total_a_recouvrer', 0))}\n\n"
+            f"📄 Documents en attente : {r.get('documents_en_attente', 0)}\n"
+            f"👨‍⚖️ Avocats actifs      : {r.get('avocats_actifs', 0)}"
+        )
+
+    if query_key == "count_dossiers":
+        lines = ["📁 Dossiers par statut :"]
+        for row in results:
+            statut = row.get('statut', '?')
+            emoji = {"en_cours": "🟢", "cloture": "✅", "suspendu": "⏸️"}.get(statut, "•")
+            lines.append(f"  {emoji} {statut} : {row.get('total', 0)}")
+        return "\n".join(lines)
+
+    if query_key == "total_honoraires":
+        r = results[0]
+        def fmt(v):
+            try: return f"{float(v):,.2f} MAD"
+            except: return f"{v} MAD"
+        return (
+            f"💰 Honoraires globaux\n"
+            f"• Total facturé  : {fmt(r.get('total_montant', 0))}\n"
+            f"• Total payé     : {fmt(r.get('total_paye', 0))}\n"
+            f"• Reste à payer  : {fmt(r.get('total_reste', 0))}\n"
+            f"• Dossiers       : {r.get('nombre_dossiers', 0)}"
+        )
+    return None
+
+
+# ── Génération réponses ───────────────────────────────────────
+
+async def generate_sql_answer(question: str, sql_context: str, query_key: str) -> dict:
     try:
-        prompt = f"""Voici les données extraites de la base de données.
-
-DONNÉES :
+        prompt = f"""Données :
 {sql_context}
 
-QUESTION : {question}
+Question : {question}
 
-Réponds de manière claire et professionnelle.
-RÉPONSE :"""
-
+Réponse courte et claire en français :"""
         answer = await call_ollama(prompt, system_prompt=SYSTEM_PROMPT_SQL)
         return {
             "answer": answer,
@@ -121,142 +142,113 @@ RÉPONSE :"""
         }
     except Exception as e:
         logger.error("llm_sql_error", error=str(e))
-        # Retourner les données brutes si LLM échoue
-        return {
-            "answer": sql_context,
-            "confidence": 0.70,
-            "sources": [{"type": "database", "query": query_key}],
-        }
+        return {"answer": sql_context, "confidence": 0.70, "sources": [{"type": "database"}]}
 
-async def generate_vector_answer(
-    question: str,
-    chunks: list[dict],
-) -> dict:
-    """
-    Génère une réponse basée sur des chunks de documents.
 
-    Returns:
-        {answer, confidence, sources}
-    """
+async def generate_vector_answer(question: str, chunks: list[dict]) -> dict:
+    # ← Réponse claire si aucun chunk
     if not chunks:
         return {
-            "answer": "Je n'ai pas trouvé de documents pertinents pour répondre à cette question.",
-            "confidence": 0.10,
+            "answer": "Je n'ai pas trouvé de documents pertinents pour cette question.\n\nSi vous cherchez le contenu d'un dossier spécifique, vérifiez que :\n• Le numéro de dossier est correct\n• Les documents ont été indexés",
+            "confidence": 0.0,
             "sources": [],
         }
 
-    # Construire le contexte depuis les chunks
     context_parts = []
     sources = []
+    seen_docs = set()
 
     for i, chunk in enumerate(chunks, 1):
+        doc_id = chunk.get("document_id")
+        nom = chunk.get("nom_fichier", "Document")
+        # Nettoyer le nom pour affichage
+        nom_affiche = nom.replace('.pdf', '').split('_')[-1] if '_' in nom else nom
         context_parts.append(
-            f"[Document {i}: {chunk.get('nom_fichier', 'N/A')} | "
-            f"Dossier: {chunk.get('numero_dossier', 'N/A')}]\n"
+            f"[Extrait {i} — {nom_affiche} | Score: {chunk.get('score', 0):.2f}]\n"
             f"{chunk['text']}"
         )
-        if chunk.get("document_id"):
+        if doc_id and doc_id not in seen_docs:
+            seen_docs.add(doc_id)
             sources.append({
-                "type": "document",
-                "document_id": chunk["document_id"],
-                "nom_fichier": chunk.get("nom_fichier", ""),
-                "dossier": chunk.get("numero_dossier", ""),
-                "score": chunk.get("score", 0),
+                "type":          "document",
+                "document_id":   doc_id,
+                "nom_fichier":   nom,
+                "dossier":       chunk.get("numero_dossier", ""),
+                "score":         chunk.get("score", 0),
                 "type_document": chunk.get("document_type", ""),
             })
 
     context = "\n\n---\n\n".join(context_parts)
-
-    # Score de confiance basé sur le meilleur score Qdrant
     best_score = max((c.get("score", 0) for c in chunks), default=0)
     confidence = round(min(0.95, best_score * 1.1), 2)
 
-    prompt = f"""Voici des extraits de documents juridiques pertinents.
+    prompt = f"""Extraits de documents juridiques :
 
-DOCUMENTS :
 {context}
 
-QUESTION : {question}
+Question : {question}
 
-Réponds en te basant UNIQUEMENT sur ces documents. Cite le document source quand pertinent.
-RÉPONSE :"""
+Réponds de manière concise en te basant UNIQUEMENT sur ces extraits.
+Si l'information n'y est pas, dis-le clairement en une phrase.
+Réponse :"""
 
     try:
         answer = await call_ollama(prompt, system_prompt=SYSTEM_PROMPT_VECTOR)
-        return {
-            "answer": answer,
-            "confidence": confidence,
-            "sources": sources,
-        }
+        return {"answer": answer, "confidence": confidence, "sources": sources}
     except Exception as e:
         logger.error("llm_vector_error", error=str(e))
-        return {
-            "answer": f"Erreur lors de la génération : {str(e)}",
-            "confidence": 0.0,
-            "sources": sources,
-        }
+        return {"answer": "Erreur lors de la génération de la réponse.", "confidence": 0.0, "sources": sources}
 
 
-async def generate_hybrid_answer(
-    question: str,
-    sql_context: str,
-    chunks: list[dict],
-) -> dict:
-    """
-    Génère une réponse combinant SQL et recherche vectorielle.
-
-    Returns:
-        {answer, confidence, sources}
-    """
+async def generate_hybrid_answer(question: str, sql_context: str, chunks: list[dict]) -> dict:
     sources = []
-
-    # Sources SQL
     if sql_context:
         sources.append({"type": "database"})
 
-    # Sources documents
+    seen_docs = set()
     for chunk in chunks:
-        if chunk.get("document_id"):
+        doc_id = chunk.get("document_id")
+        if doc_id and doc_id not in seen_docs:
+            seen_docs.add(doc_id)
             sources.append({
-                "type": "document",
-                "document_id": chunk["document_id"],
+                "type":        "document",
+                "document_id": doc_id,
                 "nom_fichier": chunk.get("nom_fichier", ""),
-                "score": chunk.get("score", 0),
+                "score":       chunk.get("score", 0),
             })
 
-    # Contexte combiné
+    # Cas dossier introuvable — réponse directe sans LLM
+    if not sql_context and not chunks:
+        return {
+            "answer": "Ce dossier n'existe pas dans le système. Vérifiez le numéro et réessayez.",
+            "confidence": 0.0,
+            "sources": [],
+        }
+
     doc_context = "\n\n".join(
-        f"[{chunk.get('nom_fichier', 'Doc')}]: {chunk['text']}"
+        f"[{chunk.get('nom_fichier', 'Doc').split('_')[-1]}]: {chunk['text']}"
         for chunk in chunks
-    )
+    ) if chunks else "Aucun document indexé pour ce dossier."
 
     best_score = max((c.get("score", 0) for c in chunks), default=0)
     confidence = round(min(0.92, 0.7 + best_score * 0.25), 2)
 
-    prompt = f"""Tu dois répondre à la question en utilisant ces deux sources :
+    prompt = f"""Réponds à la question en combinant ces sources :
 
-=== DONNÉES STRUCTURÉES (base de données) ===
-{sql_context or "Aucune donnée structurée disponible."}
+[Base de données]
+{sql_context or "Aucune donnée trouvée."}
 
-=== CONTENU DES DOCUMENTS ===
-{doc_context or "Aucun document trouvé."}
+[Documents]
+{doc_context}
 
-QUESTION : {question}
+Question : {question}
 
-Combine intelligemment les deux sources pour une réponse complète.
-RÉPONSE :"""
+Réponse structurée et concise. Si une source ne contient pas l'info, ignore-la.
+Réponse :"""
 
     try:
         answer = await call_ollama(prompt, system_prompt=SYSTEM_PROMPT_HYBRID)
-        return {
-            "answer": answer,
-            "confidence": confidence,
-            "sources": sources,
-        }
+        return {"answer": answer, "confidence": confidence, "sources": sources}
     except Exception as e:
         logger.error("llm_hybrid_error", error=str(e))
-        return {
-            "answer": f"Erreur LLM : {str(e)}",
-            "confidence": 0.0,
-            "sources": sources,
-        }
+        return {"answer": "Erreur LLM.", "confidence": 0.0, "sources": sources}

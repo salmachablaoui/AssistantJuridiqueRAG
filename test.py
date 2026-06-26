@@ -1,151 +1,29 @@
-import requests
+# debug_index.py — à lancer depuis C:\Users\salma\rag-project\
+import asyncio, os, sys
+sys.path.insert(0, ".")
 
-from app.services.pdf_service import get_text_with_ocr_fallback
-from app.services.chunk_service import chunk_text
-from app.services.embedding_service import get_embeddings
-from app.services.vector_service import VectorService
+async def main():
+    from app.config import settings
+    
+    # 1. Vérifier les chemins
+    for doc_id, chemin in [(10, "documents/4/1781513733_10_Requete.pdf"),
+                            (9,  "documents/4/1781606107_9_Jugement.pdf")]:
+        full = os.path.join(settings.PDF_STORAGE_PATH, chemin)
+        exists = os.path.exists(full)
+        size = os.path.getsize(full) if exists else 0
+        print(f"  doc_id={doc_id}: {'✓' if exists else '✗'} {full} ({size} bytes)")
+    
+    # 2. Test Qdrant
+    from app.services.qdrant_service import get_qdrant_client, get_collection_stats
+    client = get_qdrant_client()
+    print(f"\n  Qdrant collections: {[c.name for c in client.get_collections().collections]}")
+    print(f"  Stats: {get_collection_stats()}")
+    
+    # 3. Test extraction PDF
+    full = os.path.join(settings.PDF_STORAGE_PATH, "documents/4/1781513733_10_Requete.pdf")
+    if os.path.exists(full):
+        from app.services.pdf_service import get_text_with_ocr_fallback
+        text = get_text_with_ocr_fallback(full)
+        print(f"\n  Texte extrait ({len(text)} chars) : {text[:200]!r}")
 
-# =========================================
-# PDF PATH
-# =========================================
-
-pdf_path = "modèle de lettre de désignation.docx"
-
-# =========================================
-# EXTRACTION TEXTE
-# =========================================
-
-print("📄 Extraction du texte...")
-
-text = get_text_with_ocr_fallback(pdf_path)
-
-print("\n✅ TEXTE EXTRAIT (preview):\n")
-print(text[:1000])
-
-# =========================================
-# CHUNKING
-# =========================================
-
-chunks = chunk_text(
-    text,
-    chunk_size=500,
-    overlap=100
-)
-
-print(f"\n✂️ Nombre de chunks : {len(chunks)}")
-
-# =========================================
-# EMBEDDINGS
-# =========================================
-
-embeddings = get_embeddings(chunks)
-
-print("\n🧠 Embeddings générés")
-
-# =========================================
-# VECTOR STORE (FAISS)
-# =========================================
-
-vs = VectorService(dim=384)
-vs.add(embeddings, chunks)
-
-print("\n📦 Base vectorielle prête")
-
-# =========================================
-# CHAT LOOP
-# =========================================
-
-while True:
-
-    query = input("\n❓ Pose une question ('exit' pour quitter) : ")
-
-    if query.lower() == "exit":
-        break
-
-    # =====================================
-    # CAS RÉSUMÉ
-    # =====================================
-
-    if "résumé" in query.lower() or "resume" in query.lower():
-
-        prompt = f"""
-Tu es un assistant juridique professionnel.
-
-Fais un résumé clair, structuré et précis du document suivant :
-
-{text[:4000]}
-
-Réponds directement sans poser de question.
-"""
-
-    # =====================================
-    # CAS RAG
-    # =====================================
-
-    else:
-
-        query_emb = get_embeddings([query])[0]
-
-        results = vs.search(query_emb, k=3)
-
-        context = "\n".join(results)
-
-        prompt = f"""
-Tu es un assistant juridique intelligent.
-
-Réponds directement à la question en utilisant le contexte fourni.
-Ne demande jamais à l'utilisateur de poser une autre question.
-
-QUESTION:
-{query}
-
-CONTEXTE:
-{context}
-
-RÉPONSE:
-"""
-
-    # =====================================
-    # APPEL OLLAMA
-    # =====================================
-
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/chat",
-            json={
-                "model": "llama3.2",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "stream": False
-            },
-            timeout=120
-        )
-
-        data = response.json()
-
-        # DEBUG (très important)
-        print("\nDEBUG OLLAMA:", data)
-
-        # gestion erreurs
-        if "error" in data:
-            print("❌ Erreur Ollama:", data["error"])
-            continue
-
-        if "message" not in data:
-            print("❌ Format inattendu:", data)
-            continue
-
-        answer = data["message"].get("content", "").strip()
-
-        if not answer:
-            print("❌ Réponse vide du modèle")
-        else:
-            print("\n🤖 RÉPONSE :\n")
-            print(answer)
-
-    except Exception as e:
-        print("❌ Erreur requête Ollama:", str(e))
+asyncio.run(main())

@@ -9,6 +9,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import settings
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import traceback
+    error_detail = traceback.format_exc()
+    logger.error("unhandled_exception", error=str(exc), traceback=error_detail)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "traceback": error_detail}
+    )
+
 logger = structlog.get_logger()
 
 

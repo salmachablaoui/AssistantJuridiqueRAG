@@ -1,13 +1,6 @@
 # ============================================================
 # app/services/qdrant_service.py
-# REMPLACE : faiss.IndexFlatL2 (perdu à chaque redémarrage)
-# NOUVEAU   : Qdrant — persistant, filtrable, scalable
-#
-# Avantages vs FAISS pour ce cas d'usage :
-#   - Persistance sur disque (survit aux redémarrages)
-#   - Filtrage par métadonnées (dossier_id, type_document)
-#   - Scores de similarité normalisés (0-1) pour confidence score
-#   - API REST native + client Python
+# Compatible qdrant-client >= 1.7 ET anciennes versions
 # ============================================================
 
 from qdrant_client import QdrantClient
@@ -18,7 +11,6 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
-    SearchRequest,
 )
 import uuid
 import structlog
@@ -27,7 +19,6 @@ from app.config import settings
 
 logger = structlog.get_logger()
 
-# ── Client Singleton ──────────────────────────────────────────
 _client: Optional[QdrantClient] = None
 
 
@@ -35,19 +26,15 @@ def get_qdrant_client() -> QdrantClient:
     global _client
     if _client is None:
         try:
-            # Essayer le serveur Docker d'abord
             _client = QdrantClient(
                 host=settings.QDRANT_HOST,
                 port=settings.QDRANT_PORT,
                 timeout=5,
-                check_compatibility=False,
                 prefer_grpc=False,
             )
-            # Tester la connexion
             _client.get_collections()
             logger.info("qdrant_connected_server")
         except Exception:
-            # Fallback : mode fichier local (pas besoin de Docker)
             import os
             qdrant_path = os.path.join(os.getcwd(), "qdrant_storage")
             os.makedirs(qdrant_path, exist_ok=True)
@@ -57,83 +44,45 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def ensure_collection_exists() -> None:
-    """
-    Crée la collection Qdrant si elle n'existe pas.
-    Appelé au démarrage de l'application.
-    """
     client = get_qdrant_client()
     collections = [c.name for c in client.get_collections().collections]
-
     if settings.QDRANT_COLLECTION not in collections:
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION,
             vectors_config=VectorParams(
                 size=settings.QDRANT_VECTOR_SIZE,
-                distance=Distance.COSINE,       # Meilleur pour texte
+                distance=Distance.COSINE,
             ),
         )
-        logger.info(
-            "qdrant_collection_created",
-            collection=settings.QDRANT_COLLECTION,
-            vector_size=settings.QDRANT_VECTOR_SIZE,
-        )
+        logger.info("qdrant_collection_created", collection=settings.QDRANT_COLLECTION)
     else:
-        logger.info(
-            "qdrant_collection_exists",
-            collection=settings.QDRANT_COLLECTION,
-        )
+        logger.info("qdrant_collection_exists", collection=settings.QDRANT_COLLECTION)
 
 
 def upsert_chunks(chunks: list[dict], embeddings: list[list[float]]) -> int:
-    """
-    Indexe des chunks dans Qdrant avec leurs embeddings et métadonnées.
-
-    REMPLACE l'ancienne approche :
-        self.index.add(vectors)
-        self.chunks.extend(chunks)
-        # ← tout perdu au redémarrage
-
-    Args:
-        chunks: Liste de dicts {text, document_id, dossier_id, ...}
-        embeddings: Vecteurs correspondants (même ordre)
-
-    Returns:
-        Nombre de points insérés
-    """
     if not chunks or not embeddings:
         return 0
-
     client = get_qdrant_client()
-
     points = []
     for chunk, embedding in zip(chunks, embeddings):
-        point = PointStruct(
-            id=str(uuid.uuid4()),
-            vector=embedding,
-            payload={
-                "text": chunk["text"],
-                "document_id": chunk.get("document_id"),
-                "dossier_id": chunk.get("dossier_id"),
-                "document_type": chunk.get("document_type", "unknown"),
-                "chunk_index": chunk.get("chunk_index", 0),
-                "nom_fichier": chunk.get("nom_fichier", ""),
-                "affaire": chunk.get("affaire", ""),
-                "numero_dossier": chunk.get("numero_dossier", ""),
-            },
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=embedding,
+                payload={
+                    "text":           chunk.get("text", ""),
+                    "document_id":    chunk.get("document_id"),
+                    "dossier_id":     chunk.get("dossier_id"),
+                    "document_type":  chunk.get("document_type", "unknown"),
+                    "chunk_index":    chunk.get("chunk_index", 0),
+                    "nom_fichier":    chunk.get("nom_fichier", ""),
+                    "affaire":        chunk.get("affaire", ""),
+                    "numero_dossier": chunk.get("numero_dossier", ""),
+                },
+            )
         )
-        points.append(point)
-
-    client.upsert(
-        collection_name=settings.QDRANT_COLLECTION,
-        points=points,
-        wait=True,
-    )
-
-    logger.info(
-        "chunks_indexed",
-        n_points=len(points),
-        document_id=chunks[0].get("document_id") if chunks else None,
-    )
+    client.upsert(collection_name=settings.QDRANT_COLLECTION, points=points, wait=True)
+    logger.info("chunks_indexed", n_points=len(points))
     return len(points)
 
 
@@ -142,83 +91,78 @@ def search_vectors(
     top_k: int = None,
     filters: Optional[dict] = None,
 ) -> list[dict]:
-    """
-    Recherche sémantique dans Qdrant.
-
-    REMPLACE l'ancienne approche :
-        distances, indices = self.index.search(query_vector, k)
-        # ← aucun score normalisé, aucun filtre possible
-
-    Args:
-        query_embedding: Vecteur de la requête
-        top_k: Nombre de résultats
-        filters: Filtres optionnels {dossier_id: 5, document_type: "jugement"}
-
-    Returns:
-        Liste de dicts {text, score, document_id, dossier_id, ...}
-    """
     client = get_qdrant_client()
     top_k = top_k or settings.TOP_K_RESULTS
 
-    # Construction des filtres Qdrant
     qdrant_filter = None
     if filters:
-        conditions = []
-        for key, value in filters.items():
-            if value is not None:
-                conditions.append(
-                    FieldCondition(key=key, match=MatchValue(value=value))
-                )
+        conditions = [
+            FieldCondition(key=k, match=MatchValue(value=v))
+            for k, v in filters.items() if v is not None
+        ]
         if conditions:
             qdrant_filter = Filter(must=conditions)
 
-    results = client.search(
-        collection_name=settings.QDRANT_COLLECTION,
-        query_vector=query_embedding,
-        limit=top_k,
-        query_filter=qdrant_filter,
-        with_payload=True,
-        score_threshold=0.3,        # Ignorer les résultats non pertinents
-    )
+    raw_results = []
+    try:
+        response = client.query_points(
+            collection_name=settings.QDRANT_COLLECTION,
+            query=query_embedding,
+            query_filter=qdrant_filter,
+            limit=top_k,
+            with_payload=True,
+        )
+        raw_results = response.points
+        logger.info("qdrant_search_api", method="query_points", n=len(raw_results))
+    except AttributeError:
+        raw_results = client.search(
+            collection_name=settings.QDRANT_COLLECTION,
+            query_vector=query_embedding,
+            query_filter=qdrant_filter,
+            limit=top_k,
+            with_payload=True,
+            score_threshold=0.3,
+        )
+        logger.info("qdrant_search_api", method="search_legacy", n=len(raw_results))
+    except Exception as e:
+        logger.error("qdrant_search_error", error=str(e))
+        return []
 
-    return [
-        {
-            "text": r.payload.get("text", ""),
-            "score": round(r.score, 4),
-            "document_id": r.payload.get("document_id"),
-            "dossier_id": r.payload.get("dossier_id"),
-            "document_type": r.payload.get("document_type"),
-            "nom_fichier": r.payload.get("nom_fichier", ""),
-            "affaire": r.payload.get("affaire", ""),
-            "numero_dossier": r.payload.get("numero_dossier", ""),
-            "chunk_index": r.payload.get("chunk_index", 0),
-        }
-        for r in results
-    ]
+    results = []
+    for r in raw_results:
+        payload = r.payload or {}
+        score = getattr(r, "score", 0.0)
+        if score >= 0.3:
+            results.append({
+                "text":           payload.get("text", ""),
+                "score":          round(score, 4),
+                "document_id":    payload.get("document_id"),
+                "dossier_id":     payload.get("dossier_id"),
+                "document_type":  payload.get("document_type", ""),
+                "nom_fichier":    payload.get("nom_fichier", ""),
+                "affaire":        payload.get("affaire", ""),
+                "numero_dossier": payload.get("numero_dossier", ""),
+                "chunk_index":    payload.get("chunk_index", 0),
+            })
+
+    logger.info("qdrant_search_done", n_results=len(results), filters=filters)
+    return results
 
 
-def delete_document_chunks(document_id: int) -> int:
-    """
-    Supprime tous les chunks d'un document (pour réindexation).
-    Utilisé par POST /reindex.
-    """
+def delete_document_chunks(document_id: int) -> None:
     client = get_qdrant_client()
+    try:
+        client.delete(
+            collection_name=settings.QDRANT_COLLECTION,
+            points_selector=Filter(must=[
+                FieldCondition(key="document_id", match=MatchValue(value=document_id))
+            ]),
+            wait=True,
+        )
+        logger.info("document_chunks_deleted", document_id=document_id)
+    except Exception as e:
+        logger.warning("qdrant_delete_failed", error=str(e))
 
-    result = client.delete(
-        collection_name=settings.QDRANT_COLLECTION,
-        points_selector=Filter(
-            must=[
-                FieldCondition(
-                    key="document_id",
-                    match=MatchValue(value=document_id)
-                )
-            ]
-        ),
-        wait=True,
-    )
-
-    logger.info("document_chunks_deleted", document_id=document_id)
-    return result.status
 
 def get_collection_stats() -> dict:
     try:
@@ -226,7 +170,7 @@ def get_collection_stats() -> dict:
         info = client.get_collection(settings.QDRANT_COLLECTION)
         return {
             "vectors_count": info.points_count or 0,
-            "status": str(info.status),
+            "status":        str(info.status),
         }
     except Exception as e:
         return {"error": str(e)}
